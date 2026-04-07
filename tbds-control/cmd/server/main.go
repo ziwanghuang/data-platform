@@ -8,6 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"tbds-control/internal/server/api"
+	"tbds-control/internal/server/dispatcher"
 	"tbds-control/pkg/cache"
 	"tbds-control/pkg/config"
 	"tbds-control/pkg/db"
@@ -34,9 +36,10 @@ func main() {
 	mm.Register(db.NewGormModule())     // ② MySQL
 	mm.Register(cache.NewRedisModule()) // ③ Redis
 
+	mm.Register(api.NewHttpApiModule())              // ④ HTTP API
+	mm.Register(dispatcher.NewProcessDispatcher())   // ⑤ 调度引擎
+
 	// 后续步骤逐步追加：
-	// Step 2: mm.Register(api.NewHttpApiModule())
-	// Step 3: mm.Register(dispatcher.NewProcessDispatcher())
 	// Step 4: mm.Register(action.NewRedisActionLoader())
 	// Step 5: mm.Register(grpc.NewGrpcServerModule())
 
