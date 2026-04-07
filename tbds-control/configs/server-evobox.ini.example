@@ -1,0 +1,43 @@
+; =============================================================
+; TBDS Control Server — EvoBox 部署配置 (模板)
+; 复制此文件为 server-evobox.ini 并填入真实密码
+;   cp server-evobox.ini.example server-evobox.ini
+; =============================================================
+
+[server]
+http.port = 8080
+grpc.port = 9090
+
+[log]
+level = info
+
+[mysql]
+host = 182.43.29.236
+port = 3306
+user = tm
+password = <MYSQL_PASSWORD>
+database = woodpecker
+max_open_conns = 50
+max_idle_conns = 10
+conn_max_lifetime_sec = 3600
+
+[redis]
+host = 127.0.0.1
+port = 6789
+password = <REDIS_PASSWORD>
+db = 1
+pool_size = 20
+
+[dispatcher]
+refresh.interval = 200
+cleaner.interval = 5000
+
+[action]
+cache.interval = 100
+loader.batch.size = 2000
+agent.fetch.batch.size = 20
+
+[election]
+redis.key = woodpecker:server:leader
+ttl = 30
+renew.interval = 10
