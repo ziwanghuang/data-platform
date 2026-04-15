@@ -507,6 +507,95 @@ curl -s http://localhost:8080/metrics | grep woodpecker_agent_fetch_total
 2.5s 的额外延迟完全可以接受。
 ```
 
+### 延迟优化：动态心跳间隔
+
+固定 5s 心跳导致平均 2.5s、最差 5s 的任务下发延迟。对于"安装集群"这类分钟级操作确实可以接受，但如果面试官追问"能不能更快"，纯心跳捎带就显得被动——Action 在两次心跳之间产生，Agent 完全无感知，只能干等。
+
+#### 方案对比
+
+| 方案 | 延迟 | 代价 | 评价 |
+|------|------|------|------|
+| 缩短心跳到 1s | 平均 0.5s | QPS 从 1200 → 6000，仍比原 6 万低 90% | 最简单，但心跳变重 |
+| 心跳 + Server-Push 双通道 | 亚秒级 | 需新建推送通道（gRPC Stream / UDP） | 效果好但复杂度高 |
+| **动态心跳间隔** | 活跃期 0.5s | 中等代码改动，QPS 自适应 | **最佳折中** |
+
+#### 推荐方案：动态心跳间隔
+
+核心思路：检测到有任务时心跳自动加速到 1s，空闲时回落到 5s。
+
+```
+空闲期（无任务）：
+  心跳间隔 = 5s → QPS = 1200/s（不变）
+
+活跃期（有任务正在执行）：
+  心跳间隔 = 1s → QPS = 6000/s（仍比原 6 万低 90%）
+  平均下发延迟 = 0.5s（接近原轮询体感）
+
+切换条件：
+  空闲 → 活跃：心跳响应 has_pending_actions=true，或 CmdModule 正在高频模式
+  活跃 → 空闲：CmdModule 退回正常模式（连续 10 次空拉取）
+```
+
+**实现方式**：
+
+```go
+// internal/agent/heartbeat/heartbeat.go
+
+const (
+    heartbeatIntervalIdle   = 5 * time.Second  // 空闲期心跳间隔
+    heartbeatIntervalActive = 1 * time.Second   // 活跃期心跳间隔
+)
+
+type HeartBeatModule struct {
+    // ... 原有字段 ...
+    isActive   func() bool  // 🆕 查询 CmdModule 是否在高频模式
+}
+
+func (h *HeartBeatModule) heartbeatLoop(ctx context.Context) {
+    interval := heartbeatIntervalIdle
+    timer := time.NewTimer(interval)
+    defer timer.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-timer.C:
+            h.sendHeartbeat(ctx)
+
+            // 🆕 根据 CmdModule 状态动态调整间隔
+            if h.isActive != nil && h.isActive() {
+                interval = heartbeatIntervalActive
+            } else {
+                interval = heartbeatIntervalIdle
+            }
+            timer.Reset(interval)
+        }
+    }
+}
+```
+
+**集成到 main.go**：
+
+```go
+// cmd/agent/main.go
+heartbeatModule.SetActiveChecker(func() bool {
+    return cmdModule.IsActive()  // 读取 CmdModule 的 isActive 原子变量
+})
+```
+
+**效果**：
+
+| 指标 | 固定 5s 心跳 | 动态心跳 |
+|------|-------------|----------|
+| 空闲期 QPS | 1200/s | 1200/s（不变） |
+| 活跃期 QPS | 1200/s | 6000/s（仍低于原 6 万） |
+| 平均下发延迟（空闲→有任务） | 2.5s | 2.5s（首次仍由 5s 心跳发现） |
+| 平均下发延迟（活跃期连续任务） | 2.5s | **0.5s** |
+| 代码改动 | — | HeartBeatModule 加一个回调 + timer 动态调整 |
+
+> **关键洞察**：动态心跳解决的不是"首次发现任务"的延迟（那仍是 2.5s），而是"活跃期连续多批任务"的延迟——一个 Job 通常会依次生成多个 Stage 的 Action，首次 2.5s 感知后，后续 Stage 的 Action 能在 0.5s 内被发现。
+
 ---
 
 ## 七、与后续优化的衔接
@@ -567,10 +656,18 @@ curl -s http://localhost:8080/metrics | grep woodpecker_agent_fetch_total
 >
 > 第三，**渐进式增强**。心跳捎带作为 Phase 1 快速上线（1 天），后续如果需要更低延迟，可以叠加 UDP Push 作为 Phase 2，两者不冲突。"
 
+### Q: 2.5s 延迟不够快怎么办？
+
+> "这是个好的追问。2.5s 是固定 5s 心跳的平均延迟，对集群安装等分钟级操作可以接受，但如果要优化也有办法——**动态心跳间隔**。
+>
+> 思路很简单：Agent 检测到自己在执行任务（CmdModule 处于高频模式），就把心跳间隔从 5s 缩到 1s。空闲时回落到 5s。这样活跃期的平均延迟降到 0.5s，接近原轮询体感。活跃期 QPS 涨到 6000，但仍比原来的 6 万低 90%，而且空闲期完全不变。
+>
+> 更关键的是，这解决了**连续任务场景**的体验——一个 Job 往往依次生成多个 Stage 的 Action，首次发现走 5s 心跳是 2.5s 延迟，但后续 Stage 的 Action 在活跃期只需 0.5s 就能被感知到。代码改动也很小，就是心跳 timer 根据 CmdModule 状态动态调整。"
+
 ### Q: 多 Server 实例时这个方案怎么工作？
 
 > "单 Leader 模式下没问题——所有调度逻辑和心跳都在 Leader 上处理。多 Server 并行调度时，需要加一层 Redis Pub/Sub 做 Server 间事件协调：Server-A 生成 Action 后 PUBLISH 通知，Server-B 订阅后在下次心跳响应中捎带通知。Redis Pub/Sub 在这里的角色不是通知 Agent（最后一公里仍是心跳），而是解决「谁通知谁」的路由问题。"
 
 ---
 
-**一句话总结**：B1 心跳捎带通知是投入产出比最高的优化——1 个布尔字段将 6 万 QPS 降至 1200，零新组件、零防火墙风险，是 Agent 空轮询问题的最优 Phase 1 解。
+**一句话总结**：B1 心跳捎带通知是投入产出比最高的优化——1 个布尔字段将 6 万 QPS 降至 1200，零新组件、零防火墙风险；叠加动态心跳间隔后活跃期延迟降至 0.5s，兼顾低 QPS 与低延迟。

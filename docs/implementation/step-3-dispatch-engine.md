@@ -569,6 +569,55 @@ func (w *StageWorker) processStage(stage *models.Stage) error {
 | **TaskId 格式** | `{stageId}_{producerCode}_{timestamp}` 全局唯一 |
 | **Task 初始 state=Init** | 等待 TaskWorker 消费，消费后变 Running，完成后变 Success/Failed |
 
+### 5.4 竞态分析：processedStages map 与 DB 的一致性窗口
+
+StageWorker 的 `processStage()` 在基础版中**不会回查 DB 确认 Stage 当前状态**——它直接使用入队时的内存对象执行。这在几个时序窗口中会产生竞态：
+
+#### 竞态场景一：入队后、消费前，Stage 被其他流程完成
+
+```
+T1: Refresher 扫 DB → Stage-X state=Running, taskCount=0 → 不在 processedStages map → 入队成功
+T2: （与此同时）另一个已在执行的流程完成了 Stage-X → DB 里 Stage-X.state=Success，Task 已创建
+T3: StageWorker 从 channel 取出 Stage-X → processStage() 执行
+```
+
+**基础版行为**：StageWorker 直接为 Stage-X 创建 Task，产生**重复 Task**。
+
+**原因**：`processStage()` 拿到的是入队时的 Stage 内存对象，不会执行 `SELECT state FROM stage WHERE stage_id = ?` 回查。
+
+#### 竞态场景二：缓存清理与 DB 更新之间的窗口
+
+```
+T1: Stage-X 处理完成 → 从 processedStages map 中 delete（MarkStageUnprocessed）
+T2: （DB 更新 state=Success 尚未完成/提交）
+T3: Refresher 恰好此时扫 DB → state 仍为 Running, taskCount=0 → 不在 map → 入队
+T4: DB UPDATE 提交成功 → state=Success
+T5: StageWorker 消费这条 Stage → 又创建了一轮 Task
+```
+
+#### 关键结论：内存缓存是优化层，不是一致性保障层
+
+`processedStages map` 的定位是 **best-effort 去重**，用于减少重复入队、降低无谓消费——它不承担也无法承担数据一致性保障。真正的正确性由 **DB 侧操作** 保证。
+
+#### 各版本的防御策略对比
+
+| 版本 | 防御机制 | 效果 |
+|------|---------|------|
+| **Step 3 基础版** | `processStage()` 直接执行，不回查 DB | ⚠️ 存在竞态窗口，可能重复创建 Task |
+| **phase-1-design 版** | `processStage()` 内先 `COUNT(*) FROM task WHERE stage_id=?`，taskCount>0 则跳过 | ✅ 消费侧 DB 回查，防止重复 |
+| **Kafka 版 (opt-a1)** | StageConsumer 内有显式幂等检查 `taskCount > 0 → skip` | ✅ 消费侧 DB 回查，防止重复 |
+| **幂等加固版 (opt-c1c2)** | 用 `INSERT IGNORE` + Task 表唯一索引 | ✅ DB 层兜底，即使重复创建也只成功一次 |
+
+#### 分层防御体系
+
+```
+第一层：processedStages map     → best-effort 去重，减少重复入队（性能优化，允许漏网）
+第二层：消费侧 DB 回查           → 拦截大部分重复消费（taskCount > 0 则 skip）
+第三层：DB 唯一约束 INSERT IGNORE → 终极兜底，保证即使并发写入也只成功一次
+```
+
+**设计原则**：内存缓存当 best-effort 优化，DB 当 source of truth。map 与 DB 之间的短暂不一致窗口，只要 DB 操作本身是**事务性的且幂等的**，就不影响最终正确性。最坏情况也只是多一次无效的入队 + 消费侧发现已完成后 skip，浪费一点 CPU，不会产生错误数据。
+
 ---
 
 ## 六、TaskWorker 设计
@@ -1721,6 +1770,10 @@ mysql -u root -proot woodpecker -e "SELECT stage_name, state FROM stage WHERE jo
 ### 16.2 关于 MemStore 的去重机制
 
 > "200ms 轮询意味着同一个 Running Stage 可能被多次扫描到，如果不去重就会重复生成 Task。我在 MemStore 中维护了 processedStages/processedTasks 两个 map 做去重，只有首次发现的 Stage/Task 才会入队。重试时通过 MarkUnprocessed 清除标记，让 Refresher 重新发现。"
+
+### 16.2.1 关于 processedStages map 与 DB 的竞态窗口
+
+> "processedStages map 是性能优化层，不是一致性保障层——它做的是 best-effort 去重，减少 99% 的重复入队，但我不依赖它来保证正确性。基础版的 StageWorker 消费时不回查 DB 状态，确实存在竞态窗口（比如入队后、消费前 Stage 已被完成，或者缓存清理了但 DB 事务还没提交）。但这不影响最终正确性，因为真正的防线在 DB 侧：消费侧先查 taskCount 做幂等判断，Task 表唯一索引做 INSERT IGNORE 兜底。这是分布式系统处理缓存一致性的标准套路——缓存做 best-effort，DB 做 source of truth，两层分离。"
 
 ### 16.3 关于 TaskProducer 设计
 

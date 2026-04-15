@@ -85,7 +85,7 @@ DB QPS 估算（高峰时，2000 节点部署）：
 | 决策 | 选择 | 理由 |
 |------|------|------|
 | 消息队列选型 | **Kafka** | TBDS 平台本身管理 Kafka 集群，零运维成本；分区机制支持 Action 分片并行写入；Consumer Group 支持 Server 水平扩展 |
-| DB-Kafka 一致性 | **先写 DB 后发 Kafka + 补偿兜底** | 任务调度系统本身有补偿机制（CleanerWorker），不需要 Transactional Outbox 的强一致性 |
+| DB-Kafka 一致性 | **先写 Kafka 后写 DB + 幂等消费** | 宁可多发不可漏发：消息丢失的恢复成本 >> 重复消费的去重成本；Consumer 有三层幂等防护 |
 | MemStore 处理 | **删除** | Kafka 消费即处理，不再需要全量内存缓存 |
 | CleanerWorker | **保留** | 作为兜底机制，频率降低到 5~10s，仅扫描"超时未完成"的记录 |
 | 消费者配置 | `CooperativeStickyAssignor` + `static group membership` | 扩缩容时 <10% 分区迁移，滚动重启零感知 |
@@ -405,7 +405,7 @@ func (m *KafkaModule) GetWriter(topic string) *kafka.Writer {
     return m.writers[topic]
 }
 
-// newReader 创建 Consumer Reader
+// newReader 创建 Consumer Reader（手动提交 Offset，配合幂等重试）
 func (m *KafkaModule) newReader(topic string) *kafka.Reader {
     return kafka.NewReader(kafka.ReaderConfig{
         Brokers:        m.config.Brokers,
@@ -413,7 +413,7 @@ func (m *KafkaModule) newReader(topic string) *kafka.Reader {
         GroupID:        m.config.GroupID,
         MinBytes:       1,
         MaxBytes:       10e6, // 10MB
-        CommitInterval: time.Second,
+        CommitInterval: 0,    // 关闭自动提交，由 Consumer 手动 CommitMessages
         StartOffset:    kafka.LastOffset,
         // CooperativeStickyAssignor 在 kafka-go 中通过 GroupBalancers 配置
         // 增量式 Rebalance，扩容时 <10% 分区迁移
@@ -459,52 +459,75 @@ func NewJobConsumer(reader *kafka.Reader, stageWriter *kafka.Writer) *JobConsume
 func (c *JobConsumer) Start(ctx context.Context) {
     log.Info("[JobConsumer] started, consuming tbds_job")
 
+    retryCount := 0
     for {
-        msg, err := c.reader.ReadMessage(ctx)
+        msg, err := c.reader.FetchMessage(ctx)
         if err != nil {
             if ctx.Err() != nil {
-                return // context cancelled
+                return
             }
-            log.Errorf("[JobConsumer] read message failed: %v", err)
+            log.Errorf("[JobConsumer] fetch message failed: %v", err)
             time.Sleep(time.Second)
             continue
         }
 
-        c.processMessage(ctx, msg)
+        if err := c.processMessage(ctx, msg); err != nil {
+            retryCount++
+            if retryCount > 3 {
+                log.Errorf("[JobConsumer] msg exceeded max retries, sending to DLQ: %v", err)
+                c.publishToDLQ(msg)
+                c.reader.CommitMessages(ctx, msg)
+                retryCount = 0
+            } else {
+                log.Warnf("[JobConsumer] process failed (retry %d/3): %v", retryCount, err)
+                time.Sleep(time.Duration(retryCount) * time.Second) // 退避重试
+            }
+            continue
+        }
+
+        c.reader.CommitMessages(ctx, msg)
+        retryCount = 0
     }
 }
 
-func (c *JobConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+func (c *JobConsumer) processMessage(ctx context.Context, msg kafka.Message) error {
     var evt event.JobCreatedEvent
     if err := json.Unmarshal(msg.Value, &evt); err != nil {
         log.Errorf("[JobConsumer] unmarshal failed: %v", err)
-        return
+        return nil // 格式错误不重试
     }
 
     log.Infof("[JobConsumer] processing job: processId=%s, code=%s, cluster=%s",
         evt.ProcessId, evt.ProcessCode, evt.ClusterId)
 
-    // 1. 标记 Job 为 synced（幂等：CAS 更新）
+    // 1. 尝试 CAS 更新 synced（正常路径，覆盖「状态 1：DB 已写入 + 未处理」）
     result := db.DB.Model(&models.Job{}).
         Where("process_id = ? AND synced = ?", evt.ProcessId, models.JobUnSynced).
         Update("synced", models.JobSynced)
 
     if result.RowsAffected == 0 {
-        // 已经被处理过（Kafka 重复消费），跳过
-        log.Debugf("[JobConsumer] job %s already synced, skip", evt.ProcessId)
-        return
+        // 2. RowsAffected=0：区分「状态 2：已处理」和「状态 3：DB 未写入」
+        var count int64
+        db.DB.Model(&models.Job{}).Where("process_id = ?", evt.ProcessId).Count(&count)
+
+        if count > 0 {
+            // 状态 2：Job 存在但 synced=1 → 幂等跳过
+            log.Debugf("[JobConsumer] job %s already synced, skip", evt.ProcessId)
+            return nil
+        }
+        // 状态 3：Job 在 DB 中不存在 → 还没写入，返回错误触发重试
+        return fmt.Errorf("job %s not found in DB, data not ready", evt.ProcessId)
     }
 
-    // 2. 查找第一个 Running Stage
+    // 3. 查找第一个 Running Stage
     var firstStage models.Stage
     err := db.DB.Where("process_id = ? AND state = ?", evt.ProcessId, models.StateRunning).
         Order("order_num ASC").First(&firstStage).Error
     if err != nil {
-        log.Errorf("[JobConsumer] query first running stage failed: %v", err)
-        return
+        return fmt.Errorf("query first running stage failed: %w", err)
     }
 
-    // 3. 投递 StageActivatedEvent 到 tbds_stage
+    // 4. 投递 StageActivatedEvent 到 tbds_stage
     stageEvt := event.StageActivatedEvent{
         StageId:     firstStage.StageId,
         StageName:   firstStage.StageName,
@@ -522,13 +545,16 @@ func (c *JobConsumer) processMessage(ctx context.Context, msg kafka.Message) {
         Value: stageEvtBytes,
     })
     if err != nil {
-        log.Errorf("[JobConsumer] publish stage event failed: %v", err)
-        // 补偿兜底：CleanerWorker 会发现 Running Stage 无 Task，重新触发
-        return
+        // Kafka 投递失败 → 回滚 synced 状态，下次重试
+        db.DB.Model(&models.Job{}).
+            Where("process_id = ? AND synced = ?", evt.ProcessId, models.JobSynced).
+            Update("synced", models.JobUnSynced)
+        return fmt.Errorf("publish stage event failed: %w", err)
     }
 
     log.Infof("[JobConsumer] job %s synced, published stage %s (%s)",
         evt.ProcessId, firstStage.StageId, firstStage.StageName)
+    return nil
 }
 ```
 
@@ -572,44 +598,67 @@ func NewStageConsumer(reader *kafka.Reader, taskWriter *kafka.Writer) *StageCons
 func (c *StageConsumer) Start(ctx context.Context) {
     log.Info("[StageConsumer] started, consuming tbds_stage")
 
+    retryCount := 0
     for {
-        msg, err := c.reader.ReadMessage(ctx)
+        msg, err := c.reader.FetchMessage(ctx)
         if err != nil {
             if ctx.Err() != nil {
                 return
             }
-            log.Errorf("[StageConsumer] read message failed: %v", err)
+            log.Errorf("[StageConsumer] fetch message failed: %v", err)
             time.Sleep(time.Second)
             continue
         }
 
-        c.processMessage(ctx, msg)
+        if err := c.processMessage(ctx, msg); err != nil {
+            retryCount++
+            if retryCount > 3 {
+                c.publishToDLQ(msg)
+                c.reader.CommitMessages(ctx, msg)
+                retryCount = 0
+            } else {
+                log.Warnf("[StageConsumer] process failed (retry %d/3): %v", retryCount, err)
+                time.Sleep(time.Duration(retryCount) * time.Second)
+            }
+            continue
+        }
+
+        c.reader.CommitMessages(ctx, msg)
+        retryCount = 0
     }
 }
 
-func (c *StageConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+func (c *StageConsumer) processMessage(ctx context.Context, msg kafka.Message) error {
     var evt event.StageActivatedEvent
     if err := json.Unmarshal(msg.Value, &evt); err != nil {
         log.Errorf("[StageConsumer] unmarshal failed: %v", err)
-        return
+        return nil // 格式错误不重试
     }
 
     log.Infof("[StageConsumer] processing stage: %s (%s/%s)",
         evt.StageId, evt.ProcessCode, evt.StageCode)
 
-    // 幂等检查：该 Stage 是否已有 Task
+    // Layer 1: 幂等检查 — 该 Stage 是否已有 Task（状态 2：已处理）
     var taskCount int64
     db.DB.Model(&models.Task{}).Where("stage_id = ?", evt.StageId).Count(&taskCount)
     if taskCount > 0 {
         log.Debugf("[StageConsumer] stage %s already has %d tasks, skip", evt.StageId, taskCount)
-        return
+        return nil // 幂等跳过 ✅
     }
 
+    // Layer 2: 检查 Stage 是否存在于 DB（区分状态 1 和状态 3）
+    var stage models.Stage
+    if err := db.DB.Where("stage_id = ?", evt.StageId).First(&stage).Error; err != nil {
+        // 状态 3：Stage 在 DB 中不存在 → 还没写入，返回错误触发重试
+        return fmt.Errorf("stage %s not found in DB, data not ready", evt.StageId)
+    }
+
+    // 状态 1：Stage 存在 + 无 Task → 正常处理
     // 1. 查找 ProducerRegistry
     producers := producer.GetProducers(evt.ProcessCode, evt.StageCode)
     if len(producers) == 0 {
         log.Errorf("[StageConsumer] no producers found for %s/%s", evt.ProcessCode, evt.StageCode)
-        return
+        return nil // 配置错误不重试
     }
 
     // 2. 每个 Producer 生成一个 Task
@@ -625,12 +674,7 @@ func (c *StageConsumer) processMessage(ctx context.Context, msg kafka.Message) {
             State:     models.StateInit,
         }
 
-        if err := db.DB.Create(task).Error; err != nil {
-            log.Errorf("[StageConsumer] create task failed: %v", err)
-            return
-        }
-
-        // 3. 投递 TaskCreatedEvent 到 tbds_task
+        // 3. 先投递 TaskCreatedEvent 到 tbds_task（保证事件不丢）
         taskEvt := event.TaskCreatedEvent{
             TaskId:    task.TaskId,
             TaskName:  task.TaskName,
@@ -648,7 +692,15 @@ func (c *StageConsumer) processMessage(ctx context.Context, msg kafka.Message) {
         })
         if err != nil {
             log.Errorf("[StageConsumer] publish task event failed: %v", err)
-            // Task 已写入 DB，补偿机制会发现 Init 的 Task 并重新处理
+            // Kafka 不可用 → 先写 DB，CleanerWorker 会补偿投递
+        }
+
+        // 4. 后写 DB（Consumer 查不到时会重试，重试时 DB 已写入）
+        if err := db.DB.Create(task).Error; err != nil {
+            log.Errorf("[StageConsumer] create task failed: %v", err)
+            // DB 失败但 Kafka 已发出 → TaskConsumer 重试时查不到 → 重试失败
+            // → 进死信队列或 CleanerWorker 补偿
+            return
         }
 
         log.Infof("[StageConsumer] created task: %s (%s)", task.TaskId, task.TaskName)
@@ -697,36 +749,51 @@ func NewTaskConsumer(reader *kafka.Reader, actionBatchWriter *kafka.Writer) *Tas
 func (c *TaskConsumer) Start(ctx context.Context) {
     log.Info("[TaskConsumer] started, consuming tbds_task")
 
+    retryCount := 0
     for {
-        msg, err := c.reader.ReadMessage(ctx)
+        msg, err := c.reader.FetchMessage(ctx)
         if err != nil {
             if ctx.Err() != nil {
                 return
             }
-            log.Errorf("[TaskConsumer] read message failed: %v", err)
+            log.Errorf("[TaskConsumer] fetch message failed: %v", err)
             time.Sleep(time.Second)
             continue
         }
 
-        c.processMessage(ctx, msg)
+        if err := c.processMessage(ctx, msg); err != nil {
+            retryCount++
+            if retryCount > 3 {
+                c.publishToDLQ(msg)
+                c.reader.CommitMessages(ctx, msg)
+                retryCount = 0
+            } else {
+                log.Warnf("[TaskConsumer] process failed (retry %d/3): %v", retryCount, err)
+                time.Sleep(time.Duration(retryCount) * time.Second)
+            }
+            continue
+        }
+
+        c.reader.CommitMessages(ctx, msg)
+        retryCount = 0
     }
 }
 
-func (c *TaskConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+func (c *TaskConsumer) processMessage(ctx context.Context, msg kafka.Message) error {
     var evt event.TaskCreatedEvent
     if err := json.Unmarshal(msg.Value, &evt); err != nil {
         log.Errorf("[TaskConsumer] unmarshal failed: %v", err)
-        return
+        return nil
     }
 
     log.Infof("[TaskConsumer] processing task: %s (%s)", evt.TaskId, evt.TaskCode)
 
-    // 幂等检查：该 Task 是否已有 Action
+    // Layer 1: 幂等检查 — 该 Task 是否已有 Action（状态 2：已处理）
     var actionCount int64
     db.DB.Model(&models.Action{}).Where("task_id = (SELECT id FROM task WHERE task_id = ?)", evt.TaskId).Count(&actionCount)
     if actionCount > 0 {
         log.Debugf("[TaskConsumer] task %s already has %d actions, skip", evt.TaskId, actionCount)
-        return
+        return nil // 幂等跳过 ✅
     }
 
     // 1. 查找 Producer
@@ -739,15 +806,14 @@ func (c *TaskConsumer) processMessage(ctx context.Context, msg kafka.Message) {
                 "state":     models.StateFailed,
                 "error_msg": "no producer found for " + evt.TaskCode,
             })
-        return
+        return nil
     }
 
     // 2. 查询目标集群的在线 Host 列表
     var hosts []models.Host
     if err := db.DB.Where("cluster_id = ? AND status = ?",
         evt.ClusterId, models.HostOnline).Find(&hosts).Error; err != nil {
-        log.Errorf("[TaskConsumer] query hosts failed: %v", err)
-        return
+        return fmt.Errorf("query hosts failed: %w", err)
     }
 
     if len(hosts) == 0 {
@@ -757,14 +823,14 @@ func (c *TaskConsumer) processMessage(ctx context.Context, msg kafka.Message) {
                 "state":     models.StateFailed,
                 "error_msg": "no online hosts in cluster " + evt.ClusterId,
             })
-        return
+        return nil
     }
 
-    // 3. 获取 Task DB 记录（Producer.Produce 需要）
+    // 3. Layer 2: 查询 Task DB 记录（同时区分状态 1 和状态 3）
     var task models.Task
     if err := db.DB.Where("task_id = ?", evt.TaskId).First(&task).Error; err != nil {
-        log.Errorf("[TaskConsumer] query task failed: %v", err)
-        return
+        // 状态 3：Task 在 DB 中不存在 → 还没写入，返回错误触发重试
+        return fmt.Errorf("task %s not found in DB, data not ready", evt.TaskId)
     }
 
     // 4. 调用 Producer.Produce() 生成 Action 列表
@@ -802,6 +868,7 @@ func (c *TaskConsumer) processMessage(ctx context.Context, msg kafka.Message) {
 
     log.Infof("[TaskConsumer] task %s: generated %d actions for %d hosts, published to action_batch",
         evt.TaskId, len(actions), len(hosts))
+    return nil
 }
 
 // shardByHost 将 Action 列表按节点分组，每组不超过 200 条
@@ -880,30 +947,45 @@ func NewActionWriterConsumer(reader *kafkago.Reader) *ActionWriterConsumer {
 func (c *ActionWriterConsumer) Start(ctx context.Context) {
     log.Info("[ActionWriter] started, consuming tbds_action_batch")
 
+    retryCount := 0
     for {
-        msg, err := c.reader.ReadMessage(ctx)
+        msg, err := c.reader.FetchMessage(ctx)
         if err != nil {
             if ctx.Err() != nil {
                 return
             }
-            log.Errorf("[ActionWriter] read message failed: %v", err)
+            log.Errorf("[ActionWriter] fetch message failed: %v", err)
             time.Sleep(time.Second)
             continue
         }
 
-        c.processMessage(ctx, msg)
+        if err := c.processMessage(ctx, msg); err != nil {
+            retryCount++
+            if retryCount > 3 {
+                c.publishToDLQ(msg)
+                c.reader.CommitMessages(ctx, msg)
+                retryCount = 0
+            } else {
+                log.Warnf("[ActionWriter] process failed (retry %d/3): %v", retryCount, err)
+                time.Sleep(time.Duration(retryCount) * time.Second)
+            }
+            continue
+        }
+
+        c.reader.CommitMessages(ctx, msg)
+        retryCount = 0
     }
 }
 
-func (c *ActionWriterConsumer) processMessage(ctx context.Context, msg kafkago.Message) {
+func (c *ActionWriterConsumer) processMessage(ctx context.Context, msg kafkago.Message) error {
     var evt event.ActionBatchEvent
     if err := json.Unmarshal(msg.Value, &evt); err != nil {
         log.Errorf("[ActionWriter] unmarshal failed: %v", err)
-        return
+        return nil
     }
 
     if len(evt.Actions) == 0 {
-        return
+        return nil
     }
 
     log.Infof("[ActionWriter] processing batch: task=%s, %d actions", evt.TaskId, len(evt.Actions))
@@ -926,10 +1008,13 @@ func (c *ActionWriterConsumer) processMessage(ctx context.Context, msg kafkago.M
         dbActions = append(dbActions, action)
     }
 
-    // 2. 批量写入 DB（GORM CreateInBatches，幂等：INSERT IGNORE 或 ON DUPLICATE KEY）
-    if err := db.DB.CreateInBatches(dbActions, 200).Error; err != nil {
-        log.Errorf("[ActionWriter] batch insert DB failed: %v", err)
-        return
+    // 2. 批量写入 DB（幂等：INSERT IGNORE，action_id 唯一键冲突 → 跳过）
+    // ActionWriter 是链路末端写入者，不存在"DB 还没写入"的问题
+    if err := db.DB.Clauses(clause.OnConflict{
+        Columns:   []clause.Column{{Name: "action_id"}},
+        DoNothing: true,
+    }).CreateInBatches(dbActions, 200).Error; err != nil {
+        return fmt.Errorf("batch insert DB failed: %w", err)
     }
 
     // 3. Pipeline ZADD 到 Redis
@@ -955,6 +1040,7 @@ func (c *ActionWriterConsumer) processMessage(ctx context.Context, msg kafkago.M
 
     log.Infof("[ActionWriter] wrote %d actions to DB+Redis for task %s",
         len(dbActions), evt.TaskId)
+    return nil
 }
 ```
 
@@ -996,29 +1082,46 @@ func NewResultAggregator(reader *kafkago.Reader, stageWriter *kafkago.Writer) *R
 func (c *ResultAggregator) Start(ctx context.Context) {
     log.Info("[ResultAggregator] started, consuming tbds_action_result")
 
+    retryCount := 0
     for {
-        msg, err := c.reader.ReadMessage(ctx)
+        msg, err := c.reader.FetchMessage(ctx)
         if err != nil {
             if ctx.Err() != nil {
                 return
             }
-            log.Errorf("[ResultAggregator] read message failed: %v", err)
+            log.Errorf("[ResultAggregator] fetch message failed: %v", err)
             time.Sleep(time.Second)
             continue
         }
 
-        c.processMessage(ctx, msg)
+        if err := c.processMessage(ctx, msg); err != nil {
+            retryCount++
+            if retryCount > 3 {
+                c.publishToDLQ(msg)
+                c.reader.CommitMessages(ctx, msg)
+                retryCount = 0
+            } else {
+                log.Warnf("[ResultAggregator] process failed (retry %d/3): %v", retryCount, err)
+                time.Sleep(time.Duration(retryCount) * time.Second)
+            }
+            continue
+        }
+
+        c.reader.CommitMessages(ctx, msg)
+        retryCount = 0
     }
 }
 
-func (c *ResultAggregator) processMessage(ctx context.Context, msg kafkago.Message) {
+func (c *ResultAggregator) processMessage(ctx context.Context, msg kafkago.Message) error {
     var evt event.ActionResultEvent
     if err := json.Unmarshal(msg.Value, &evt); err != nil {
         log.Errorf("[ResultAggregator] unmarshal failed: %v", err)
-        return
+        return nil
     }
 
     // 1. CAS 更新 Action 状态（幂等：WHERE state = Executing）
+    // ResultAggregator 消费 Agent 上报结果 → Action 一定已在 DB 中
+    // 不存在"DB 还没写入"的问题
     result := db.DB.Model(&models.Action{}).
         Where("id = ? AND state = ?", evt.ActionId, models.ActionStateExecuting).
         Updates(map[string]interface{}{
@@ -1030,8 +1133,8 @@ func (c *ResultAggregator) processMessage(ctx context.Context, msg kafkago.Messa
         })
 
     if result.RowsAffected == 0 {
-        // 已被更新过（重复消费 or 超时标记），跳过
-        return
+        // 已被更新过（重复消费 or 超时标记），幂等跳过
+        return nil
     }
 
     // 2. 从 Redis 移除已完成的 Action
@@ -1039,6 +1142,7 @@ func (c *ResultAggregator) processMessage(ctx context.Context, msg kafkago.Messa
 
     // 3. 检查 Task 完成度
     c.checkTaskCompletion(ctx, evt.TaskId, evt.StageId, evt.JobId)
+    return nil
 }
 
 // checkTaskCompletion 检查 Task 下所有 Action 是否完成，推进 Stage 链表
@@ -1110,41 +1214,13 @@ func (c *ResultAggregator) checkTaskCompletion(ctx context.Context, taskId int64
 }
 
 // completeStage 标记 Stage 成功 → 激活下一个 Stage 或完成 Job
+// 关键：先投 Kafka 激活下一 Stage → 后 CAS 更新当前 Stage
+// 原因：如果先 CAS 后投 Kafka，进程崩溃会导致 Stage 链表断链（当前已 Success 但下一个永远不激活）
 func (c *ResultAggregator) completeStage(ctx context.Context, stage *models.Stage) {
     now := time.Now()
-    result := db.DB.Model(stage).
-        Where("state = ?", models.StateRunning). // CAS
-        Updates(map[string]interface{}{
-            "state":    models.StateSuccess,
-            "progress": 100.0,
-            "endtime":  &now,
-        })
 
-    if result.RowsAffected == 0 {
-        return // 已被更新过
-    }
-
-    log.Infof("[ResultAggregator] stage %s completed: %s", stage.StageId, stage.StageName)
-
-    if stage.IsLastStage {
-        // Job 完成
-        db.DB.Model(&models.Job{}).Where("id = ? AND state = ?", stage.JobId, models.StateRunning).
-            Updates(map[string]interface{}{
-                "state":    models.StateSuccess,
-                "progress": 100.0,
-                "endtime":  &now,
-            })
-        log.Infof("[ResultAggregator] job %d completed", stage.JobId)
-        return
-    }
-
-    // 激活下一个 Stage
-    if stage.NextStageId != "" {
-        db.DB.Model(&models.Stage{}).
-            Where("stage_id = ? AND state = ?", stage.NextStageId, models.StateInit).
-            Update("state", models.StateRunning)
-
-        // 投递到 tbds_stage Topic，触发 StageConsumer 处理
+    if !stage.IsLastStage && stage.NextStageId != "" {
+        // 1. 先投递下一个 StageActivatedEvent（保证链表不断）
         var nextStage models.Stage
         if err := db.DB.Where("stage_id = ?", stage.NextStageId).First(&nextStage).Error; err != nil {
             log.Errorf("[ResultAggregator] query next stage failed: %v", err)
@@ -1163,12 +1239,48 @@ func (c *ResultAggregator) completeStage(ctx context.Context, stage *models.Stag
         }
         stageEvtBytes, _ := json.Marshal(stageEvt)
 
-        c.stageWriter.WriteMessages(ctx, kafkago.Message{
+        if err := c.stageWriter.WriteMessages(ctx, kafkago.Message{
             Key:   []byte(nextStage.StageId),
             Value: stageEvtBytes,
-        })
+        }); err != nil {
+            log.Errorf("[ResultAggregator] publish next stage event failed: %v", err)
+            // Kafka 不可用 → 不更新当前 Stage 状态，等下次重试
+            // 这样 checkTaskCompletion 下次还会进入 completeStage
+            return
+        }
 
         log.Infof("[ResultAggregator] activated next stage: %s", nextStage.StageId)
+
+        // 2. Kafka 投递成功后，更新下一 Stage 状态
+        db.DB.Model(&models.Stage{}).
+            Where("stage_id = ? AND state = ?", stage.NextStageId, models.StateInit).
+            Update("state", models.StateRunning)
+    }
+
+    // 3. 最后 CAS 更新当前 Stage（幂等：WHERE state = Running）
+    result := db.DB.Model(stage).
+        Where("state = ?", models.StateRunning). // CAS
+        Updates(map[string]interface{}{
+            "state":    models.StateSuccess,
+            "progress": 100.0,
+            "endtime":  &now,
+        })
+
+    if result.RowsAffected == 0 {
+        return // 已被更新过（重复消费场景）
+    }
+
+    log.Infof("[ResultAggregator] stage %s completed: %s", stage.StageId, stage.StageName)
+
+    if stage.IsLastStage {
+        // Job 完成
+        db.DB.Model(&models.Job{}).Where("id = ? AND state = ?", stage.JobId, models.StateRunning).
+            Updates(map[string]interface{}{
+                "state":    models.StateSuccess,
+                "progress": 100.0,
+                "endtime":  &now,
+            })
+        log.Infof("[ResultAggregator] job %d completed", stage.JobId)
     }
 }
 
@@ -1196,14 +1308,14 @@ func (c *ResultAggregator) failStage(ctx context.Context, stage *models.Stage) {
 ```go
 // internal/server/api/job_handler.go（改造）
 
-// CreateJob 改造：写 DB 后投递 Kafka（而非依赖 Worker 扫描）
+// CreateJob 改造：先投 Kafka 后写 DB（宁可多发不可漏发）
 func (h *JobHandler) CreateJob(c *gin.Context) {
-    // ... 原有逻辑：解析请求 + 事务创建 Job+Stage ...
+    // ... 原有逻辑：解析请求、生成 ProcessId + Stage 列表 ...
 
-    // 事务提交成功后，投递到 Kafka
+    // 1. 先投递到 Kafka（保证事件不丢）
     jobEvt := event.JobCreatedEvent{
         ProcessId:   job.ProcessId,
-        JobId:       job.Id,
+        JobId:       0, // DB 写入后回填，Consumer 通过 ProcessId 关联
         JobName:     job.JobName,
         ProcessCode: job.ProcessCode,
         ClusterId:   job.ClusterId,
@@ -1211,16 +1323,23 @@ func (h *JobHandler) CreateJob(c *gin.Context) {
     }
     jobEvtBytes, _ := json.Marshal(jobEvt)
 
-    // 先写 DB 后发 Kafka + 补偿兜底
     err := h.kafkaWriter.WriteMessages(context.Background(), kafka.Message{
         Topic: TopicJob,
         Key:   []byte(job.ProcessId),
         Value: jobEvtBytes,
     })
     if err != nil {
-        // Kafka 投递失败，但 DB 已写入
-        // 补偿兜底：CleanerWorker 会发现 synced=0 的 Job 并重新投递
-        log.Warnf("[CreateJob] kafka publish failed, compensation will handle: %v", err)
+        // Kafka 不可用 → 降级为直接写 DB（CleanerWorker 会补偿投递）
+        log.Warnf("[CreateJob] kafka publish failed, fallback to DB-only: %v", err)
+    }
+
+    // 2. 后写 DB（事务创建 Job + Stage）
+    if err := h.createJobTx(job, stages); err != nil {
+        // DB 写入失败 → 返回错误
+        // Kafka 消息已发出，但 Consumer 查 DB 查不到 → 处理失败 → 自动重试
+        // 重试时如果 DB 仍不可用 → 进死信队列 → 人工介入
+        c.JSON(500, gin.H{"code": -1, "msg": "create job failed"})
+        return
     }
 
     c.JSON(200, gin.H{"code": 0, "data": gin.H{"jobId": job.Id, "processId": job.ProcessId}})
@@ -1472,9 +1591,9 @@ kafka-topics --create --bootstrap-server broker:9092 --topic tbds_action_result 
   ✏️ internal/server/grpc/cmd_service.go — CmdReport 投递 Kafka
 
 步骤：
-  1. CreateJob 写 DB 后投递 tbds_job Topic
+  1. CreateJob 先投递 tbds_job Topic 后写 DB
   2. CmdReportChannel 投递 tbds_action_result Topic
-  3. 两处都保留降级路径（Kafka 失败时直接操作 DB）
+  3. 两处都保留降级路径（Kafka 失败时直接操作 DB，CleanerWorker 补偿）
 
 验证：
   □ curl 创建 Job → Kafka 消息可见 → Consumer 处理 → 端到端完成
@@ -1563,36 +1682,368 @@ kafka-topics --create --bootstrap-server broker:9092 --topic tbds_action_result 
 
 ---
 
-## 九、DB-Kafka 一致性策略
+## 九、DB-Kafka 写入顺序与一致性策略
 
-### 9.1 一致性方案选型
+### 9.1 核心问题：先写 DB 还是先写 Kafka？
+
+这是事件驱动架构中最关键的一致性设计决策。两种顺序各有风险：
+
+```
+方案 A：先写 DB 后发 Kafka（❌ 本方案不采用）
+  1. 写 DB 成功 ✅
+  2. 发 Kafka 失败 ❌（进程崩溃 / 网络抖动 / Kafka 宕机）
+  → 数据在 DB 里了，但下游 Consumer 永远收不到通知
+  → 只能等 CleanerWorker 10s 后补偿
+  → 问题：补偿本质是退化为轮询，违背了事件驱动的初衷
+
+方案 B：先发 Kafka 后写 DB（✅ 本方案采用）
+  1. 写 Kafka 成功 ✅
+  2. Consumer 消费了，但 DB 还没写入 ❌
+  → Consumer 查 DB 查不到数据 → 处理失败 → 不提交 Offset → 自动重试
+  → 重试时 DB 大概率已写入 → 正常处理
+  → 最坏情况：重复消费 → 幂等机制兜底（CAS + INSERT IGNORE）
+```
+
+**关键不对称性**：Kafka 消息丢了 = 事件丢失，只能靠补偿轮询兜底（退化）；Kafka 消息多了 = 重复消费，幂等机制轻松兜底（不退化）。**宁可多发不可漏发。**
+
+### 9.2 逐场景分析
+
+| 场景 | 写入顺序 | Kafka 先于 DB 的风险 | 兜底机制 |
+|------|---------|---------------------|---------|
+| **CreateJob** | 先投 `tbds_job` → 后事务写 DB | JobConsumer 消费时 DB 中无 Job → 查不到 synced 字段 → 处理失败 | 不提交 Offset → Kafka 自动重试，下次 DB 已写入 |
+| **StageConsumer 创建 Task** | 先投 `tbds_task` → 后 DB.Create(task) | TaskConsumer 消费时 DB 中无 Task → actionCount 查询返回 0 → Produce 时查不到 Task 记录 → 处理失败 | 同上，Kafka 重试 |
+| **ResultAggregator 激活下一 Stage** | 先投 `tbds_stage` → 后 CAS 更新当前 Stage | StageConsumer 消费时当前 Stage 还没标记 Success → 但下一 Stage 已被激活 → 并行执行 | 下一 Stage 的处理不依赖当前 Stage 的 DB 状态，无影响 |
+| **gRPC CmdReport** | 先投 Kafka，失败降级 DB | ✅ 已是正确顺序 | 降级路径直接操作 DB |
+
+### 9.3 "先 Kafka 后 DB"的重试窗口分析
+
+```
+时间线：
+  T0: 投递 Kafka 消息 ✅
+  T1: 写入 DB（正常场景 T1 - T0 < 10ms）
+  
+  Consumer 消费延迟 = Kafka 内部延迟 ≈ 5~50ms
+  → 绝大多数情况下 Consumer 消费时 DB 已写入
+  
+极端场景：Consumer 在 DB 写入前就消费了
+  → Consumer 查不到数据 → 处理失败 → 不提交 Offset
+  → Kafka 在 session.timeout (10s) 后重新分配消息
+  → 重试时 DB 一定已写入（写 DB 只需 <10ms）
+  → 正常处理 ✅
+
+更极端场景：DB 写入永久失败（DB 宕机）
+  → Consumer 持续重试 → 持续失败 → 3 次后进死信队列
+  → 但此时整个系统已不可用（DB 挂了），不是 Kafka 顺序问题
+```
+
+### 9.4 为什么"先 DB 后 Kafka"不好？
+
+```
+场景：CreateJob 先写 DB 后投 Kafka
+
+T0: 事务写 DB 成功 ✅ — Job 入库，synced=0
+T1: 投递 Kafka... 进程崩溃 💥
+→ Job 卡在 synced=0
+→ 需要等 CleanerWorker 10s 后扫描发现 → 重新投递
+→ 但如果 CleanerWorker 也挂了呢？→ Job 永远卡住
+
+更糟糕的场景：ResultAggregator 先 CAS 更新 Stage → 后投 Kafka
+
+T0: 当前 Stage 标记 Success ✅
+T1: 投递下一个 StageActivatedEvent... 进程崩溃 💥
+→ 当前 Stage 已 Success，但下一个 Stage 永远不被激活
+→ 这是 Stage 链表断链！整个 Job 永远卡在中间
+→ CleanerWorker 能发现 Running 的 Stage 无 Task，但它不知道该 Stage 已被激活只是没消费
+```
+
+**Stage 链表断链是最危险的**——先发 Kafka 就不会有这个问题，因为即使重复激活下一个 Stage，幂等检查（taskCount > 0 → skip）会阻止重复处理。
+
+### 9.5 一致性方案选型
 
 | 方案 | 复杂度 | 一致性 | 适用场景 |
 |------|--------|--------|---------|
 | **Transactional Outbox** | 高 | 强最终一致 | 支付、订单等不可丢失场景 |
-| **先写 DB 后发 Kafka + 补偿（✅ 采用）** | 低 | 弱最终一致 | 任务调度场景足够 |
+| **先写 Kafka 后写 DB + 幂等消费（✅ 采用）** | 低 | 最终一致 | 任务调度场景，Consumer 有幂等防护 |
 | **CDC（Change Data Capture）** | 中 | 强最终一致 | 有 Debezium 基础设施 |
 | **Kafka 事务（Exactly-Once）** | 中 | 强 | Kafka → Kafka 场景 |
 
-### 9.2 采用方案详解
+### 9.6 为什么不用 Transactional Outbox？
+
+> **工程判断**：Outbox 在支付/订单场景是标准做法，但任务调度系统的 Consumer 天然具备幂等性（CAS + INSERT IGNORE + 前置检查三层防护），重复消费不会产生副作用。Outbox 引入额外的 Outbox 表 + 轮询线程 + 状态管理，复杂度高于收益。
+>
+> "先 Kafka 后 DB"配合幂等消费，已经能保证**最终一致性**——消息不丢（Kafka 持久化 + ACK），重复消费无害（三层幂等），DB 写入几乎不会失败（<10ms 的写入窗口）。这是最简单且足够正确的方案。
+
+### 9.7 CleanerWorker 补偿仍然保留
+
+即使改为"先 Kafka 后 DB"，CleanerWorker 补偿仍有价值——它兜底的是 **Kafka 本身不可用**的极端场景：
 
 ```
-主路径：
-  1. 写入 DB（事务内）
-  2. 发送 Kafka 消息
-  3. 成功 → 流程继续
-  4. Kafka 发送失败 → 日志 Warn，流程继续（DB 数据已持久化）
-
-补偿兜底：
-  CleanerWorker（10s 间隔）扫描以下异常数据：
-  • synced=0 且超过 30s 的 Job → 重新投递 tbds_job
+补偿兜底（10s 间隔，仅极端场景触发）：
+  • synced=0 且超过 30s 的 Job → 重新投递 tbds_job（DB 写入成功但 Kafka 挂了）
   • state=Running 且无 Task 超过 30s 的 Stage → 重新投递 tbds_stage
   • state=Init 且超过 30s 的 Action → 重新加载到 Redis
 ```
 
-### 9.3 为什么不用 Transactional Outbox？
+注意：在"先 Kafka 后 DB"策略下，上述补偿场景更少触发——因为 Kafka 消息已先发出，正常路径不会丢消息。补偿只在 Kafka 集群本身故障时才需要。
 
-> **工程判断**：Outbox 在支付/订单场景是标准做法，但任务调度系统本身有补偿机制（定时扫描超时/未完成记录），即使 Kafka 消息丢了也能兜底。Outbox 引入额外的表 + 轮询线程 + 状态管理，复杂度高于收益。面试中可以说"评估后认为补偿机制已足够，Outbox 在这个场景下是过度设计"——这展示的是**工程判断力**。
+### 9.8 幂等消费详解：「先 Kafka 后 DB」场景下的三种消费状态
+
+"先 Kafka 后 DB"带来了一个**传统幂等设计中不存在的问题**：Consumer 收到消息时，DB 里可能还没有数据。
+
+传统"先 DB 后 Kafka"的幂等很简单——Consumer 消费时 DB 数据一定存在，只需要判断"是否已处理"。但"先 Kafka 后 DB"下，Consumer 面对三种状态：
+
+```
+状态 1：DB 已写入 + 未处理过  → 正常处理 ✅
+状态 2：DB 已写入 + 已处理过  → 幂等跳过 ✅（传统幂等解决的问题）
+状态 3：DB 还没写入           → 需要重试 🔄（先 Kafka 后 DB 独有的问题）
+
+关键：状态 2 和状态 3 在"查不到数据"的表现上完全一样！
+Consumer 必须能区分它们，否则会把"DB 还没写入"误判为"已处理完毕"而跳过。
+```
+
+#### 逐 Consumer 幂等实现
+
+**① JobConsumer — CAS 更新 synced 字段**
+
+```go
+func (c *JobConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+    var evt event.JobCreatedEvent
+    json.Unmarshal(msg.Value, &evt)
+
+    // Step 1: 尝试 CAS 更新（正常路径，覆盖状态 1）
+    result := db.DB.Model(&models.Job{}).
+        Where("process_id = ? AND synced = ?", evt.ProcessId, models.JobUnSynced).
+        Update("synced", models.JobSynced)
+
+    if result.RowsAffected == 1 {
+        // 状态 1：正常处理，继续投递 Stage
+        c.publishFirstStage(ctx, evt)
+        return
+    }
+
+    // Step 2: RowsAffected=0 → 区分状态 2 和状态 3
+    var count int64
+    db.DB.Model(&models.Job{}).Where("process_id = ?", evt.ProcessId).Count(&count)
+
+    if count > 0 {
+        // 状态 2：Job 存在但 synced=1 → 已处理过，幂等跳过
+        log.Debugf("[JobConsumer] job %s already synced, skip", evt.ProcessId)
+        return
+    }
+
+    // 状态 3：Job 在 DB 中不存在 → DB 还没写入，返回错误触发重试
+    log.Warnf("[JobConsumer] job %s not found in DB, will retry", evt.ProcessId)
+    panic("job not found, trigger kafka retry")  // 不提交 Offset
+}
+```
+
+> **为什么用 panic？** `kafka-go` 的 `ReadMessage` 是自动提交 Offset 的。如果 `processMessage` 正常返回，Offset 就被提交了，消息就不会重试。要触发重试，需要让 Consumer 不提交 Offset——最直接的方式是 panic 让消费循环的 recover 捕获，然后 sleep 后重试。更优雅的做法是用 `FetchMessage` + 手动 `CommitMessages`（见下方改进方案）。
+
+**② StageConsumer — 前置检查 taskCount**
+
+```go
+func (c *StageConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+    var evt event.StageActivatedEvent
+    json.Unmarshal(msg.Value, &evt)
+
+    // Step 1: 幂等检查 — 该 Stage 是否已有 Task（状态 2）
+    var taskCount int64
+    db.DB.Model(&models.Task{}).Where("stage_id = ?", evt.StageId).Count(&taskCount)
+    if taskCount > 0 {
+        log.Debugf("[StageConsumer] stage %s already has %d tasks, skip", evt.StageId, taskCount)
+        return  // 幂等跳过 ✅
+    }
+
+    // Step 2: 检查 Stage 是否存在于 DB（区分状态 1 和状态 3）
+    var stage models.Stage
+    if err := db.DB.Where("stage_id = ?", evt.StageId).First(&stage).Error; err != nil {
+        // 状态 3：Stage 在 DB 中不存在 → 还没写入，返回错误触发重试
+        log.Warnf("[StageConsumer] stage %s not found in DB, will retry", evt.StageId)
+        return  // 不提交 Offset → 重试
+    }
+
+    // 状态 1：Stage 存在 + 无 Task → 正常处理
+    producers := producer.GetProducers(evt.ProcessCode, evt.StageCode)
+    // ... 创建 Task，先投 Kafka 后写 DB ...
+}
+```
+
+> **StageConsumer 的特殊之处**：它的幂等检查（taskCount > 0）天然不会误判——如果 Stage 还没写入 DB，那它的 Task 也不可能存在，taskCount 一定是 0。所以 StageConsumer 需要**额外一次 SELECT 查 Stage 是否存在**来区分状态 1 和状态 3。
+
+**③ TaskConsumer — 前置检查 actionCount**
+
+```go
+func (c *TaskConsumer) processMessage(ctx context.Context, msg kafka.Message) {
+    var evt event.TaskCreatedEvent
+    json.Unmarshal(msg.Value, &evt)
+
+    // Step 1: 幂等检查（状态 2）
+    var actionCount int64
+    db.DB.Model(&models.Action{}).
+        Where("task_id = (SELECT id FROM task WHERE task_id = ?)", evt.TaskId).
+        Count(&actionCount)
+    if actionCount > 0 {
+        return  // 已有 Action，幂等跳过 ✅
+    }
+
+    // Step 2: 查询 Task 记录（同时区分状态 1 和状态 3）
+    var task models.Task
+    if err := db.DB.Where("task_id = ?", evt.TaskId).First(&task).Error; err != nil {
+        // 状态 3：Task 不存在 → DB 还没写入，触发重试
+        log.Warnf("[TaskConsumer] task %s not found in DB, will retry", evt.TaskId)
+        return  // 不提交 Offset → 重试
+    }
+
+    // 状态 1：Task 存在 + 无 Action → 正常处理
+    // ... Produce Actions, 投递 action_batch ...
+}
+```
+
+> **TaskConsumer 与 StageConsumer 的幂等模式完全一致**：先查下游产物是否存在（actionCount > 0 → 幂等跳过），再查自身是否在 DB 中（不存在 → 重试）。
+
+**④ ActionWriterConsumer — INSERT IGNORE 天然幂等**
+
+```go
+func (c *ActionWriterConsumer) processMessage(ctx context.Context, msg kafkago.Message) {
+    var evt event.ActionBatchEvent
+    json.Unmarshal(msg.Value, &evt)
+
+    // ActionWriter 的幂等天然简单：
+    // INSERT IGNORE / ON DUPLICATE KEY UPDATE 保证重复写入不报错
+    // Action 的唯一键是 action_id（由 TaskConsumer 生成的 UUID）
+
+    // 重复消费场景：
+    //   第一次：INSERT 200 条 Action → 成功
+    //   第二次：INSERT IGNORE 200 条 → action_id 重复 → 全部跳过
+
+    // "先 Kafka 后 DB"场景：
+    //   ActionWriter 是链路末端的写入者，它自己就是"写 DB"的那一步
+    //   不存在"DB 还没写入"的问题——它就是负责写 DB 的！
+    //   所以 ActionWriter 不需要额外的重试逻辑
+
+    db.DB.Clauses(clause.OnConflict{
+        Columns:   []clause.Column{{Name: "action_id"}},
+        DoNothing: true,  // INSERT IGNORE 语义
+    }).CreateInBatches(dbActions, 200)
+
+    // ... Pipeline ZADD Redis + 更新 state=Cached ...
+}
+```
+
+**⑤ ResultAggregator — CAS 乐观锁天然幂等**
+
+```go
+func (c *ResultAggregator) processMessage(ctx context.Context, msg kafkago.Message) {
+    var evt event.ActionResultEvent
+    json.Unmarshal(msg.Value, &evt)
+
+    // CAS 更新 Action 状态（WHERE state = Executing）
+    // 重复消费：第二次 state 已经不是 Executing → RowsAffected=0 → 跳过
+    result := db.DB.Model(&models.Action{}).
+        Where("id = ? AND state = ?", evt.ActionId, models.ActionStateExecuting).
+        Updates(...)
+
+    if result.RowsAffected == 0 {
+        return  // 已更新过 or Action 不存在 → 幂等跳过
+    }
+
+    // ResultAggregator 消费的是 Agent 上报的结果
+    // 此时 Action 一定已在 DB 中（Agent 是从 Redis 拿到 Action 才执行的）
+    // 所以不存在"DB 还没写入"的问题
+}
+```
+
+#### 三层幂等防护总结
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                   三层幂等防护体系                                  │
+│                                                                  │
+│  Layer 1: 前置检查（快速跳过已处理的消息）                          │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ JobConsumer:    synced=1 → skip                           │  │
+│  │ StageConsumer:  taskCount > 0 → skip                      │  │
+│  │ TaskConsumer:   actionCount > 0 → skip                    │  │
+│  │ ActionWriter:   INSERT IGNORE（唯一键冲突 → skip）         │  │
+│  │ ResultAgg:      CAS WHERE state=Executing → 0 rows → skip │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Layer 2: DB 存在性检查（区分"已处理"和"DB 还没写入"）             │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ JobConsumer:    SELECT count WHERE process_id=X            │  │
+│  │ StageConsumer:  SELECT stage WHERE stage_id=X              │  │
+│  │ TaskConsumer:   SELECT task WHERE task_id=X                │  │
+│  │ ActionWriter:   不需要（自己就是写 DB 的）                  │  │
+│  │ ResultAgg:      不需要（Action 一定已存在）                 │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Layer 3: CAS 乐观锁（最终防线，防止并发写入冲突）                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ 所有状态更新都用 WHERE state = old_state                   │  │
+│  │ 并发场景：两个 Consumer 同时处理同一条消息                   │  │
+│  │ → 只有一个 RowsAffected=1，另一个 RowsAffected=0 → skip   │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### 改进：手动提交 Offset 替代自动提交
+
+上面的幂等逻辑有一个前提：**消费失败时不能提交 Offset**。`kafka-go` 的 `ReadMessage()` 会自动提交 Offset，无法做到"处理失败不提交"。需要改为 `FetchMessage()` + 手动 `CommitMessages()`：
+
+```go
+// 改进前：ReadMessage 自动提交（失败时无法重试）
+msg, err := c.reader.ReadMessage(ctx)
+
+// 改进后：FetchMessage + 手动提交（失败时不提交 → 自动重试）
+msg, err := c.reader.FetchMessage(ctx)
+if err != nil {
+    continue
+}
+
+if err := c.processMessage(ctx, msg); err != nil {
+    // 处理失败 → 不提交 Offset → Kafka 重新投递
+    log.Warnf("process failed, will retry: %v", err)
+    retryCount++
+    if retryCount > 3 {
+        c.publishToDLQ(msg)  // 超过重试次数 → 死信队列
+        c.reader.CommitMessages(ctx, msg)  // 提交 Offset，避免无限重试
+        retryCount = 0
+    }
+    time.Sleep(retryBackoff(retryCount))
+    continue
+}
+
+// 处理成功 → 提交 Offset
+c.reader.CommitMessages(ctx, msg)
+retryCount = 0
+```
+
+**Reader 配置也需要调整**：
+
+```go
+reader := kafka.NewReader(kafka.ReaderConfig{
+    Brokers:        brokers,
+    Topic:          topic,
+    GroupID:        "tbds-server",
+    // 关键：关闭自动提交，改为手动提交
+    CommitInterval: 0,  // 0 = 禁用自动提交
+    StartOffset:    kafka.LastOffset,
+})
+```
+
+> **配合 processMessage 返回 error**：原来 processMessage 是 void 返回，需要改为返回 error。"DB 数据不存在"返回 `ErrNotReady`，"已处理过"返回 nil（幂等成功），真正的处理失败返回具体 error。
+
+```go
+var ErrNotReady = errors.New("data not ready in DB, need retry")
+
+func (c *JobConsumer) processMessage(ctx context.Context, msg kafka.Message) error {
+    // ...
+    if count == 0 {
+        return ErrNotReady  // 状态 3：触发重试
+    }
+    return nil  // 状态 2：幂等跳过
+}
+```
 
 ---
 
@@ -1657,15 +2108,35 @@ Kafka 消息消费
 
 > "原系统 6 个 Worker 以 200ms~1s 间隔轮询 DB，即使没有任何任务在执行也有 33 QPS 打到数据库。在 2000 节点场景下高峰期更是 10 万+ QPS。核心问题是**所有任务流转都依赖定时扫描发现变化**，没有事件通知机制。
 >
-> 我的方案是用 Kafka 消息总线替代轮询。设计了 5 个 Topic：`job_topic`→`stage_topic`→`task_topic`→`action_batch`→`action_result`，形成异步流水线。CreateJob 写 DB 后投递 Kafka，下游 Consumer 消费后生成 Stage/Task/Action，不再需要定时扫描。效果是空闲 DB QPS 从 33 降到接近 0，任务触发延迟从秒级降到 50ms 以内。"
+> 我的方案是用 Kafka 消息总线替代轮询。设计了 5 个 Topic：`job_topic`→`stage_topic`→`task_topic`→`action_batch`→`action_result`，形成异步流水线。CreateJob 先投递 Kafka 再写 DB（宁可多发不可漏发），下游 Consumer 消费后生成 Stage/Task/Action，不再需要定时扫描。效果是空闲 DB QPS 从 33 降到接近 0，任务触发延迟从秒级降到 50ms 以内。"
 
-### Q: Kafka 消息丢了怎么办？
+### Q: Kafka 消息丢了怎么办？DB 和 Kafka 怎么保证一致性？
 
-> "我采用'先写 DB 后发 Kafka + 补偿兜底'策略。DB 数据是确定持久化的，Kafka 消息即使丢了，CleanerWorker 每 10 秒扫描一次，发现'synced=0 超过 30s 的 Job'或'Running 但无 Task 的 Stage'就会重新投递。
+> "我采用的是**先写 Kafka 后写 DB**的策略。核心原则是'宁可多发不可漏发'——Kafka 消息重复了，Consumer 有三层幂等防护（CAS + INSERT IGNORE + 前置检查）兜底，不会产生副作用；但 Kafka 消息丢了，就只能退化到补偿轮询，这违背了事件驱动的设计初衷。
 >
-> 同时每个 Consumer 都有幂等检查——用 CAS（`WHERE state = old_state`）保证重复消费不会产生副作用。
+> 先写 Kafka 的风险是 Consumer 消费时 DB 可能还没写入——但因为 Kafka 消费延迟通常 5~50ms，而 DB 写入 <10ms，绝大多数情况 Consumer 消费时 DB 已经就绪。极端情况 Consumer 查不到就不提交 Offset，Kafka 自动重试，第二次一定能查到。
 >
-> 我评估过 Transactional Outbox 模式，但认为在任务调度场景下属于过度设计——我们的补偿机制本身就能保证最终一致性，没必要引入额外的 Outbox 表和轮询线程。"
+> 特别是 ResultAggregator 激活下一个 Stage 的场景——如果先 CAS 标记当前 Stage 为 Success 再投 Kafka，进程崩溃就会导致 Stage 链表断链：当前已完成但下一个永远不被激活。先投 Kafka 就不会有这个问题。
+>
+> CleanerWorker 每 10s 扫描一次作为兜底，但在'先 Kafka 后 DB'策略下它触发的频率极低——只在 Kafka 集群本身故障时才需要。"
+
+### Q: 为什么不是先写 DB 后发 Kafka？很多系统都是这么做的
+
+> "先写 DB 后发 Kafka 的问题在于**消息可能永远丢失**。DB 提交成功后进程崩溃，Kafka 消息没发出去，下游永远不知道有新数据。虽然 CleanerWorker 10s 后能补偿，但这意味着每个环节都可能有 10s 的额外延迟，而且补偿逻辑本质就是轮询——我们花大力气从轮询改成事件驱动，结果关键路径还是靠轮询兜底，这就本末倒置了。
+>
+> 反过来，先写 Kafka 后写 DB，消息一定不会丢（Kafka ACK 后已持久化）。最坏情况是 Consumer 消费时 DB 数据还没到——但这只是个几毫秒的时间窗口，不提交 Offset 让 Kafka 重试就行了。重复消费的问题靠幂等机制兜底，成本远低于消息丢失。
+>
+> 总结就是一句话：**消息丢失的恢复成本 >> 重复消费的去重成本**。"
+
+### Q: 先 Kafka 后 DB，Consumer 消费时数据还没写入怎么办？怎么实现幂等？
+
+> "这是'先 Kafka 后 DB'策略的核心挑战——Consumer 面对三种状态：DB 已写入且未处理（正常处理）、DB 已写入且已处理（幂等跳过）、DB 还没写入（需要重试）。关键是**后两种状态在查不到数据时的表现完全一样**，必须能区分。
+>
+> 我的做法是**两步检查**。第一步是前置幂等检查：查下游产物是否存在——比如 StageConsumer 检查 taskCount > 0，TaskConsumer 检查 actionCount > 0，如果下游已有数据说明已处理过，直接跳过。第二步是 DB 存在性检查：如果下游无数据，再查当前记录本身是否存在——不存在说明 DB 还没写入，返回错误触发 Kafka 重试；存在说明是首次处理，正常往下走。
+>
+> 具体到技术实现上有三层防护。Layer 1 前置检查快速跳过已处理消息；Layer 2 DB 存在性检查区分'已处理'和'DB 还没写入'；Layer 3 CAS 乐观锁（`WHERE state = old_state`）防并发冲突。再配合 `FetchMessage` + 手动 `CommitMessages` 确保处理失败时不提交 Offset。
+>
+> 还有两个 Consumer 比较特殊：ActionWriter 是链路末端的写入者，它自己就是写 DB 的，用 `INSERT IGNORE` 天然幂等，不存在'DB 还没写入'的问题；ResultAggregator 消费的是 Agent 上报结果，Action 一定已在 DB 中（Agent 是从 Redis 拿到 Action 才执行的），CAS 就够了。"
 
 ### Q: 为什么选 Kafka 而不是 Redis Stream 或 NATS？
 
